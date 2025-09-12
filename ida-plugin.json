@@ -1,0 +1,12 @@
+{
+    "IDAMetadataDescriptorVersion": 1,
+    "plugin": {
+        "name": "hex-rays enums helper",
+        "entryPoint": "enums_helper.py",
+        "description": "A plugin to assist with Hex-Rays enum management",
+        "categories": ["ui-ux-and-visualization"],
+        "idaVersions": ">=9.2",
+        "version": "1.0.0",
+        "logoPath": "logo.jpg"
+    }
+}
