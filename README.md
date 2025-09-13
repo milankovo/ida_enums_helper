@@ -1,4 +1,4 @@
-# IDA Enum Helper Plugin
+# IDA Enums Helper Plugin
 
 ![logo](logo.jpg)
 
