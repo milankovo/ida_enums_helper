@@ -13,21 +13,25 @@ logger.setLevel(logging.INFO)
 NETNODE_NAME = "$ enums_helper"
 last_enum_used: str | None = None
 
-vvv = 0
-
 
 class EnumChooser(idaapi.Choose):
-    def __init__(self, title="Please choose enum", value=0):
-        self.value = value
+    def __init__(self, title="Please choose enum", values: list[int] | None = None):
+        self.values = values or []
         super().__init__(
             title,
-            cols=[["Enumeration", 30], ["Member", 30]],
+            cols=[
+                ["#name of the enum#Enumeration", idaapi.Choose.CHCOL_PLAIN | 30],
+                ["#Matching member already present in the enum#Members", idaapi.Choose.CHCOL_PLAIN | 20],
+                ["#List of number that will be added to the enum#Missing", idaapi.Choose.CHCOL_PLAIN | 30],
+                ["#number of matching members#matching", idaapi.Choose.CHCOL_DEC | 5],
+                ["#number of missing members#missing", idaapi.Choose.CHCOL_DEC | 5],
+            ],
             flags=idaapi.Choose.CH_MODAL,
         )
         self.items = self._get_enum_list()
 
     def _get_enum_list(self):
-        enums = [("<NEW>", "<NEW>")]
+        enums = [("<NEW>", "", "", "", "")]
 
         for i in range(1, idaapi.get_ordinal_limit()):
             if not idaapi.is_type_choosable(None, i):  # type: ignore
@@ -41,14 +45,21 @@ class EnumChooser(idaapi.Choose):
                 logger.debug(f"Skipping unnamed enum with ordinal {i}: {t.dstr()}")
                 continue
 
-            idx, item = t.get_edm_by_value(self.value)
+            members = []
+            missing = []
+            for value in self.values:
+                idx, item = t.get_edm_by_value(value)
+                if idx != -1:
+                    members.append(f"{value}={item.name}")
+                else:
+                    missing.append(str(value))
 
-            if idx == -1:
-                member = "<NEW>"
-            else:
-                member = item.name
+            members = list(sorted(set(members)))
 
-            enums.append((name, member))
+            members_str = ", ".join(members)
+            missing_str = ", ".join(missing)
+
+            enums.append((name, members_str, missing_str, str(len(members)), str(len(missing))))
         return enums
 
     def OnGetSize(self):
@@ -83,8 +94,11 @@ def ask_new_enum() -> idaapi.tinfo_t | None:
     return idaapi.tinfo_t(tid=tid)
 
 
-def choose_or_create_enum(value: int):
-    chooser = EnumChooser(value=value)
+def choose_or_create_enum(values: list[int]) -> idaapi.tinfo_t | None:
+    chooser = EnumChooser(
+        values=values,
+        title="Please choose enum",
+    )
     selected = chooser.Show(modal=True)
     if selected < 0:
         return None
@@ -123,7 +137,7 @@ class base_action_handler_t(idaapi.action_handler_t):
             action.unregister()
 
 
-def make_enum(nf: idaapi.number_format_t, enum_name: str):
+def update_number_format_with_enum_name(nf: idaapi.number_format_t, enum_name: str):
     shift = idaapi.get_operand_type_shift(ord(nf.opnum))
     mask = 0xF << shift
     enum = 0x8 << shift
@@ -141,7 +155,8 @@ def dump_user_numforms(vu):
 def update_number_formats(
     cfunc: idaapi.cfuncptr_t, ea: int, nf: idaapi.number_format_t
 ):
-    # very annoying idapython feature
+    # very annoying idapython feature/bug: hexrays.hpp items with type 'char' are mapped to 'str' instead of 'int'
+    # so we need to convert it back to int
     opnum = nf.opnum
     if isinstance(opnum, str):
         opnum = ord(opnum)
@@ -164,20 +179,53 @@ def add_enum_member(ti: idaapi.tinfo_t, v: int) -> bool:
         )
         return True
 
-    new_name = idaapi.ask_ident(
-        f"val_{v}",
-        f"Name for new enum member of {ti.get_type_name()}",
-    )
+    i = 0
+    while True:
+        default_name = f"val_{v}"
+        if i > 0:
+            default_name = f"{default_name}_{i}"
+        i += 1
 
-    if not new_name:
-        logger.warning("No name provided for the new enum member. Operation aborted.")
+        new_name = idaapi.ask_ident(
+            default_name,
+            f"Name for new enum member of {ti.get_type_name()}",
+        )
+
+        if not new_name:
+            logger.warning(
+                "No name provided for the new enum member. Operation aborted."
+            )
+            return False
+
+        try:
+            ti.add_edm(new_name, v)
+            return True
+        except ValueError as e:
+            if "name is used in another enum" in str(e):
+                logger.warning(
+                    f"Name '{new_name}' is already used in another enum. Please choose a different name."
+                )
+                continue
+            logger.error(f"Error: Failed to add the enum member. {e}")
+            return False
+
+
+def switch_has_cases_not_covered_by_enum(citem: idaapi.ctree_item_t) -> bool:
+    switch = citem_to_switch(citem)
+    if switch is None:
         return False
-    try:
-        ti.add_edm(new_name, v)
-    except ValueError as e:
-        logger.error(f"Error: Failed to add the enum member. {e}")
-        return False
-    return True
+
+    type_name = switch.mvnf.nf.type_name
+    ti = idaapi.tinfo_t(name=type_name)
+    if not ti.is_enum():
+        return True
+
+    for case in switch.cases:
+        for v in case.values:
+            idx, edm = ti.get_edm_by_value(v)
+            if idx == -1:
+                return True
+    return False
 
 
 def is_number(ctx: idaapi.action_ctx_base_t):
@@ -187,32 +235,76 @@ def is_number(ctx: idaapi.action_ctx_base_t):
     vu: idaapi.vdui_t = idaapi.get_widget_vdui(ctx.widget)
     if vu is None:
         return idaapi.AST_DISABLE
+
     vu.get_current_item(idaapi.USE_KEYBOARD)
+
+    if not vu.item.is_citem():
+        return idaapi.AST_DISABLE
 
     num = vu.get_number()
     if num is None:
         return idaapi.AST_DISABLE
-    if num.nf.is_enum():
+
+    if num.nf.is_enum() and not switch_has_cases_not_covered_by_enum(vu.item):
         return idaapi.AST_DISABLE
+
     return idaapi.AST_ENABLE
 
 
-def update_enum_member(ti: idaapi.tinfo_t, num: idaapi.cnumber_t, vu: idaapi.vdui_t):
-    if not add_enum_member(ti, num._value):
+def update_cnumber(num: idaapi.cnumber_t, ti: idaapi.tinfo_t, vu: idaapi.vdui_t):
+    update_number_format_with_enum_name(num.nf, ti.get_type_name())
+
+    citem: idaapi.ctree_item_t = vu.item
+    if not citem.is_citem():
         return
 
-    global last_enum_used
-    last_enum_used = ti.get_type_name()
+    if not citem.is_citem():  # tail, etc.
+        logger.debug("Not a citem")
+        return
 
-    make_enum(num.nf, last_enum_used)
+    it = citem.it
 
-    update_number_formats(vu.cfunc, vu.item.e.ea, num.nf)
-    vu.item.e.type = ti
+    citem_ea = citem.get_ea()
+    if citem_ea != it.ea:
+        logger.warning(
+            f"inconsistent ea between citem.get_ea()={citem_ea:x} and citem.it.ea={it.ea:x} for {it.to_specific_type.opname}"  # type: ignore
+        )
 
-    # dump_user_numforms(vu)
+    update_number_formats(vu.cfunc, it.ea, num.nf)
+    if it.is_expr():
+        citem.e.type = ti
 
-    # vu.refresh_ctext(False)
     vu.cfunc.refresh_func_ctext()
+
+
+def citem_to_switch(citem: idaapi.ctree_item_t) -> idaapi.cswitch_t | None:
+    if not citem.is_citem():
+        return None
+
+    if citem.it.op != idaapi.cit_switch:
+        return None
+
+    switch = citem.it.to_specific_type.cswitch  # type: ignore
+    return switch
+
+
+def gather_values(vu: idaapi.vdui_t) -> list[int]:
+    num: idaapi.cnumber_t = vu.get_number()
+    if num is None:
+        return []
+
+    values = [num._value]
+
+    switch = citem_to_switch(vu.item)
+    if switch is None:
+        return values
+
+    case: idaapi.ccase_t
+    for case in switch.cases:
+        values.extend(case.values)
+
+    values = list(sorted(set(values)))  # unique
+    return values
 
 
 class add_number_to_enum_action_handler_t(base_action_handler_t):
@@ -224,17 +316,27 @@ class add_number_to_enum_action_handler_t(base_action_handler_t):
         vu: idaapi.vdui_t = idaapi.get_widget_vdui(ctx.widget)
         vu.get_current_item(idaapi.USE_KEYBOARD)
 
+        # for switch it returns its cnumber_t that contains the maximum value
         num: idaapi.cnumber_t = vu.get_number()
 
         if num is None:
             return 0
 
-        ti = choose_or_create_enum(num._value)
+        values = gather_values(vu)
+
+        ti = choose_or_create_enum(values)
         if ti is None:
             logger.warning("No enumeration selected. Please try again.")
             return 0
 
-        update_enum_member(ti, num, vu)
+        for v in values:
+            if not add_enum_member(ti, v):
+                return 0
+
+        global last_enum_used
+        last_enum_used = ti.get_type_name()
+
+        update_cnumber(num, ti, vu)
         return 1
 
     def update(self, ctx: idaapi.action_ctx_base_t):
@@ -256,12 +358,20 @@ class add_number_to_last_enum_action_handler_t(base_action_handler_t):
             return 0
 
         global last_enum_used
+        if last_enum_used is None:
+            logger.warning("No enumeration selected. Please try again.")
+            return 0
         ti = idaapi.tinfo_t(name=last_enum_used)
         if ti is None:
             logger.warning("No enumeration selected. Please try again.")
             return 0
 
-        update_enum_member(ti, num, vu)
+        values = gather_values(vu)
+        for v in values:
+            if not add_enum_member(ti, v):
+                return 0
+
+        update_cnumber(num, ti, vu)
         return 1
 
     def update(self, ctx: idaapi.action_ctx_base_t):
