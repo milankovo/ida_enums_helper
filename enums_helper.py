@@ -21,8 +21,8 @@ class EnumChooser(idaapi.Choose):
             title,
             cols=[
                 ["#name of the enum#Enumeration", idaapi.Choose.CHCOL_PLAIN | 30],
-                ["#Matching member already present in the enum#Members", idaapi.Choose.CHCOL_PLAIN | 20],
-                ["#List of number that will be added to the enum#Missing", idaapi.Choose.CHCOL_PLAIN | 30],
+                ["#Matching members already present in the enum#Members", idaapi.Choose.CHCOL_PLAIN | 20],
+                ["#List of numbers that will be added to the enum#Missing", idaapi.Choose.CHCOL_PLAIN | 30],
                 ["#number of matching members#matching", idaapi.Choose.CHCOL_DEC | 5],
                 ["#number of missing members#missing", idaapi.Choose.CHCOL_DEC | 5],
             ],
